@@ -36,8 +36,7 @@ My goal is a system where fixed surveillance cameras detect the threat, and with
   - Blocking disk I/O (saving images/features) is offloaded to background threads.
   - GPU-accelerated where possible, with CPU fallback.
   - Minimal GUI overhead for maximum speed.
-  - OpenCV thread control (`cv2.setNumThreads(1)`).
-
+    
 ---
 
 ## Quick Start ⚡
