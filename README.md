@@ -1,4 +1,4 @@
-# Real-Time Criminal Detection System 🚨🛩️
+# Real-Time Suspect Detection System 🚨🛩️
 
 ## Why
 In some gun-related crimes that occur in public spaces, the attacker commits the act and disappears from the scene within seconds — and sometimes, they’re never caught.
