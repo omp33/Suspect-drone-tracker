@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+env/
+ENV/
+build/
+dist/
+
+# Model weights & runtime outputs
+*.pt
+*.pth
+*.onnx
+*.mp4
+*.avi
+criminal_data/
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp

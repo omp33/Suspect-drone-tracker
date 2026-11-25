@@ -1,677 +1,662 @@
+"""
+Ground Camera Threat Detector (Coordinated Dual-Pass Gun-Keypoint Fusion + Pose + ByteTrack)
+=============================================================================================
+Combines YOLOv8-Pose + ByteTrack with a security-audited CCTV firearm detector
+using Full-Frame + Pose-Guided Wrist-ROI dual inference and directional forearm-grip
+attribution for sub-second threat confirmation:
+- Tier 1 (GUN+POSE):    Weapon in wrist/grip ray + aiming/ready arm (1-frame instant lock)
+- Tier 2 (GUN-IN-HAND): High-conf pistol (>=0.60, 1-frame) or >=weapon_conf (2-frame lock)
+                        Catches waist/chest/downward/frontal holds without raised arms
+- Tier 3 (POSE):        Strict scale-invariant aiming pose fallback (occluded/tiny firearm)
+
+Usage:
+    python detector.py --source path/to/video.mp4
+    python detector.py --source 0 --no-display --save-video ground_out.mp4
+"""
+
+import os
+import time
+import argparse
+from collections import defaultdict, deque
+from threading import Thread, Lock
+
 import cv2
 import numpy as np
-import math
-from collections import defaultdict
-import time
-import torch
-import torchreid
-from PIL import Image
-from threading import Thread
-import os
-import faiss
 from ultralytics import YOLO
-from numba import jit, njit, prange
 
-# Ensure OpenCV does not use multiple threads internally, which can conflict with our threading
+from reid_utils import (
+    load_osnet_model,
+    ensure_cctv_weapon_model,
+    ensure_weapon_onnx_model,
+    verify_pytorch_checkpoint_safety,
+    extract_reid_feature,
+    extract_outfit_color_feature,
+    draw_hud_panel,
+    draw_label_pill,
+    draw_corner_box,
+)
+
 cv2.setNumThreads(1)
+_save_lock = Lock()
 
-# Global configuration and state variables
-threat_history = defaultdict(list)  # Stores recent threat detections for each person
-persistence_frames = 7  # Number of frames to consider for confirming a threat
-min_confidence = 0.45  # Minimum confidence for YOLO detections (currently not directly used in the loop, but good to have)
-frame_count = 0  # Global frame counter
-confirmed_threats = set()  # Set of person IDs confirmed as threats
-reid_features = {}  # Stores re-identification features for detected individuals
-detection_stopped = False  # Flag to stop detection after a criminal is identified and saved
+WEAPON_CLASS_NAMES = {"pistol", "gun", "handgun", "rifle", "firearm", "weapon"}
 
-def update_frame():
-    """Increments the global frame counter."""
-    global frame_count
-    frame_count += 1
 
-def _get_person_id(bbox):
+def _point_to_box_dist(px: float, py: float, x1: float, y1: float, x2: float, y2: float) -> float:
+    """Euclidean distance from point (px, py) to axis-aligned rectangle [x1, y1, x2, y2] (0 if inside)."""
+    dx = max(x1 - px, 0.0, px - x2)
+    dy = max(y1 - py, 0.0, py - y2)
+    return float(np.hypot(dx, dy))
+
+
+def get_arm_grips(keypoints: np.ndarray, box: np.ndarray, conf_thresh: float = 0.40) -> list:
     """
-    Generates a unique ID for a person based on their bounding box center.
-    This helps in tracking individuals coarsely across frames.
+    Build per-arm grip rays from wrist + forearm direction so hand/barrel reach
+    along the pointing axis is modeled accurately while keeping off-axis false positives out.
+    Returns list of dicts: {"side": "L"|"R", "wrist": np.ndarray, "ray_pts": [np.ndarray, ...]}.
     """
-    center_x = (bbox[0] + bbox[2]) / 2
-    center_y = (bbox[1] + bbox[3]) / 2
-    # Quantize coordinates to create a grid-based ID
-    return (round(center_x / 50) * 50, round(center_y / 50) * 50)
+    kp = np.asarray(keypoints, dtype=np.float32)
+    box_h = max(1.0, float(box[3] - box[1]))
+    torso_h = max(box_h * 0.30, 25.0)
+    grips = []
+    for side, e_idx, w_idx in (("L", 7, 9), ("R", 8, 10)):
+        if kp.shape[0] <= w_idx or kp[w_idx, 2] < conf_thresh:
+            continue
+        wrist = kp[w_idx, :2]
+        ray_pts = [wrist]
+        if kp[e_idx, 2] >= conf_thresh:
+            forearm = wrist - kp[e_idx, :2]
+            flen = float(np.linalg.norm(forearm))
+            if flen > 1e-4:
+                reach = 0.45 * min(flen, 0.55 * torso_h)
+                u = forearm / flen
+                for frac in (0.35, 0.70, 1.0):
+                    ray_pts.append(wrist + (frac * reach) * u)
+        grips.append({"side": side, "wrist": wrist, "ray_pts": ray_pts})
+    return grips
 
-def add_threat_detection(person_bbox, is_threat):
-    """
-    Updates the threat history for a person and determines if they are a confirmed threat.
 
-    Args:
-        person_bbox (list): Bounding box coordinates of the person.
-        is_threat (bool): True if the current pose analysis indicates a threat, False otherwise.
-
-    Returns:
-        bool: True if the person is a confirmed threat, False otherwise.
-    """
-    global threat_history, confirmed_threats, frame_count
-    person_id = _get_person_id(person_bbox)
-    current_time = frame_count
-
-    # Add current detection to history
-    threat_history[person_id].append((current_time, is_threat))
-
-    # Clean up old entries from history (only keep recent ones)
-    threat_history[person_id] = [
-        (t, threat) for t, threat in threat_history[person_id]
-        if current_time - t <= persistence_frames * 2
-    ]
-
-    # Count recent threat detections
-    recent_threats = [
-        threat for t, threat in threat_history[person_id]
-        if current_time - t <= persistence_frames and threat
-    ]
-
-    # Confirm threat if enough recent threat detections
-    if len(recent_threats) >= persistence_frames // 2:
-        confirmed_threats.add(person_id)
-        return True
-    else:
-        confirmed_threats.discard(person_id)
-        return False
-
-# Numba-optimized functions for pose analysis (for performance)
-if 'profile' not in globals():
-    def profile(func):
-        return func
-
-@njit(fastmath=True, cache=True)
-def calculate_angle_numba(x1, y1, x2, y2, x3, y3):
-    """
-    Calculates the angle between three points (p1-p2-p3) using Numba for optimization.
-
-    Args:
-        x1, y1 (float): Coordinates of point 1.
-        x2, y2 (float): Coordinates of point 2 (vertex).
-        x3, y3 (float): Coordinates of point 3.
-
-    Returns:
-        float: Angle in degrees.
-    """
-    v1x = x1 - x2
-    v1y = y1 - y2
-    
-    v2x = x3 - x2
-    v2y = y3 - y2
-    
-    dot_product = v1x * v2x + v1y * v2y
-    
-    mag1 = math.sqrt(v1x * v1x + v1y * v1y)
-    mag2 = math.sqrt(v2x * v2x + v2y * v2y)
-    
-    if mag1 == 0.0 or mag2 == 0.0:
-        return 0.0
-    
-    cos_angle = dot_product / (mag1 * mag2)
-    
-    # Clip cos_angle to avoid numerical issues that can lead to NaN from acos
-    if cos_angle > 1.0:
-        cos_angle = 1.0
-    elif cos_angle < -1.0:
-        cos_angle = -1.0
-    
-    angle = math.degrees(math.acos(cos_angle))
-    return angle
-
-@njit(fastmath=True, cache=True)
-def is_arm_straight_numba(x1, y1, x2, y2, x3, y3, threshold=40.0):
-    """
-    Checks if an arm (shoulder-elbow-wrist) is straight using Numba.
-
-    Args:
-        x1, y1 (float): Shoulder coordinates.
-        x2, y2 (float): Elbow coordinates.
-        x3, y3 (float): Wrist coordinates.
-        threshold (float): Maximum deviation from 180 degrees for a straight arm.
-
-    Returns:
-        bool: True if the arm is considered straight, False otherwise.
-    """
-    angle = calculate_angle_numba(x1, y1, x2, y2, x3, y3)
-    return abs(180.0 - angle) <= threshold
-
-@njit(fastmath=True, cache=True)
-def is_forward_aiming_numba(shoulder_x, shoulder_y, wrist_x, wrist_y, body_center_x, body_center_y, max_y_diff=51.0):
-    """
-    Checks if an arm is aiming forward, relative to the body center, using Numba.
-
-    Args:
-        shoulder_x, shoulder_y (float): Shoulder coordinates.
-        wrist_x, wrist_y (float): Wrist coordinates.
-        body_center_x, body_center_y (float): Body center coordinates.
-        max_y_diff (float): Maximum allowed vertical difference between wrist and shoulder for "forward aiming".
-
-    Returns:
-        bool: True if the arm is considered to be aiming forward, False otherwise.
-    """
-    dx = wrist_x - body_center_x
-    dy = abs(wrist_y - shoulder_y)
-    # Checks for significant horizontal displacement and small vertical displacement
-    return abs(dx) > 50.0 and dy < max_y_diff
-
-def calculate_angle(point1, point2, point3):
-    """
-    Calculates the angle between three points (p1-p2-p3).
-    This is a non-Numba version, primarily for clarity or fallback.
-    """
-    try:
-        p1 = np.array(point1)
-        p2 = np.array(point2)
-        p3 = np.array(point3)
-        v1 = p1 - p2
-        v2 = p3 - p2
-        cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
-        cos_angle = np.clip(cos_angle, -1.0, 1.0)
-        angle = math.degrees(math.acos(cos_angle))
-        return angle
-    except:
+def build_wrist_roi(kp_np: np.ndarray, box_np: np.ndarray, frame_w: int, frame_h: int):
+    """Build a padded crop bounding wrists & forearms for small distant firearm recovery."""
+    kp = np.asarray(kp_np, dtype=np.float32)
+    pts = [kp[k, :2] for k in (7, 8, 9, 10) if kp.shape[0] > k and kp[k, 2] >= 0.30]
+    if not pts:
         return None
-
-def is_arm_straight(shoulder, elbow, wrist, threshold=40):
-    """
-    Checks if an arm (shoulder-elbow-wrist) is straight using the non-Numba angle calculation.
-    """
-    if None in [shoulder, elbow, wrist]:
-        return False
-    angle = calculate_angle(shoulder, elbow, wrist)
-    if angle is None:
-        return False
-    return abs(180 - angle) <= threshold
-
-def get_arm_angle_from_torso(shoulder, elbow, hip):
-    """
-    Calculates the angle of the arm relative to the torso (not directly used for threat detection, but useful).
-    """
-    if None in [shoulder, elbow, hip]:
+    xs = [float(p[0]) for p in pts]
+    ys = [float(p[1]) for p in pts]
+    ph = max(1.0, float(box_np[3] - box_np[1]))
+    margin = max(56.0, 0.30 * ph)
+    rx1 = max(0, int(min(xs) - margin))
+    rx2 = min(frame_w, int(max(xs) + margin))
+    ry1 = max(0, int(min(ys) - margin))
+    ry2 = min(frame_h, int(max(ys) + margin))
+    if rx2 - rx1 < 24 or ry2 - ry1 < 24:
         return None
-    reference_point = (hip[0], hip[1] - 100) # A point directly above the hip to define a vertical line for reference
-    angle = calculate_angle(reference_point, shoulder, elbow)
-    return angle
+    return (rx1, ry1, rx2, ry2)
 
-def analyze_pose_threat(keypoints_batch, confidence_threshold=0.5):
+
+def deduplicate_weapons(detections: list, iou_thresh: float = 0.45) -> list:
+    """Sort weapon detections by confidence and suppress overlapping Pass 1 / Pass 2 duplicates."""
+    if len(detections) <= 1:
+        return detections
+    ordered = sorted(detections, key=lambda x: x[4], reverse=True)
+    kept = []
+    for cand in ordered:
+        cx1, cy1, cx2, cy2 = cand[:4]
+        ca = max(1.0, (cx2 - cx1) * (cy2 - cy1))
+        dup = False
+        for k in kept:
+            ix1, iy1 = max(cx1, k[0]), max(cy1, k[1])
+            ix2, iy2 = min(cx2, k[2]), min(cy2, k[3])
+            if ix2 > ix1 and iy2 > iy1:
+                inter = (ix2 - ix1) * (iy2 - iy1)
+                ua = ca + max(1.0, (k[2] - k[0]) * (k[3] - k[1])) - inter
+                if inter / max(1.0, ua) >= iou_thresh:
+                    dup = True
+                    break
+        if not dup:
+            kept.append(cand)
+    return kept
+
+
+def assign_weapons_to_people(weapon_detections: list, person_entries: list) -> dict:
     """
-    Analyzes a batch of keypoints to determine if a threatening pose is detected.
+    1-to-1 forearm-grip ray attribution: assigns each detected weapon box to at most ONE
+    person & arm side whose grip segment [wrist -> projected barrel reach] falls within
+    tight distance of the box (filtering out oversized torso/background hallucinations).
 
-    Args:
-        keypoints_batch (np.array): Keypoints for one or more persons.
-                                    Shape: (N, 17, 3) where N is number of persons,
-                                    17 keypoints (x, y, confidence).
-        confidence_threshold (float): Minimum confidence for a keypoint to be considered valid.
-
-    Returns:
-        list of dict: Analysis results for each person, including 'is_threat' and details.
-                      If N=1, returns a single dictionary instead of a list.
+    Returns: dict[track_id] -> list of (wbox_tuple, arm_side, dist_px)
     """
-    keypoints_batch = np.asarray(keypoints_batch)
-    if keypoints_batch.ndim == 2:
-        keypoints_batch = keypoints_batch[None, ...] # Add batch dimension if only one person
+    assigned = defaultdict(list)
+    if not weapon_detections or not person_entries:
+        return assigned
 
-    N = keypoints_batch.shape[0] # Number of persons in the batch
+    for wbox in weapon_detections:
+        wx1, wy1, wx2, wy2, _w_conf, _w_name = wbox
+        gw = max(1.0, wx2 - wx1)
+        gh = max(1.0, wy2 - wy1)
+        g_area = gw * gh
+        g_cx, g_cy = 0.5 * (wx1 + wx2), 0.5 * (wy1 + wy2)
+        grip_radius = max(16.0, 0.28 * max(gw, gh))
 
-    # Mappings for keypoint indices
-    idxs = {
-        'left_shoulder': 5, 'right_shoulder': 6,
-        'left_elbow': 7, 'right_elbow': 8,
-        'left_wrist': 9, 'right_wrist': 10,
-        'left_hip': 11, 'right_hip': 12
+        best = None  # (score, tid, side, dist)
+        for tid, pbox, arm_grips in person_entries:
+            pw = max(1.0, float(pbox[2] - pbox[0]))
+            ph = max(1.0, float(pbox[3] - pbox[1]))
+            p_area = pw * ph
+            if g_area > 0.14 * p_area or max(gw, gh) > 0.45 * ph:
+                continue  # Reject oversized person/jacket/prop false positives
+            for arm in arm_grips:
+                min_d = min(_point_to_box_dist(float(pt[0]), float(pt[1]), wx1, wy1, wx2, wy2) for pt in arm["ray_pts"])
+                if min_d <= grip_radius:
+                    # Tie-break by center proximity when multiple points touch the box
+                    cd = float(np.hypot(float(arm["ray_pts"][-1][0]) - g_cx, float(arm["ray_pts"][-1][1]) - g_cy))
+                    rank = (min_d, cd)
+                    if best is None or rank < best[0]:
+                        best = (rank, tid, arm["side"], min_d)
+
+        if best is not None:
+            assigned[best[1]].append((wbox, best[2], best[3]))
+    return assigned
+
+
+def analyze_pose_threat(keypoints: np.ndarray, box: np.ndarray, conf_thresh: float = 0.55):
+    """
+    Scale-invariant aiming-pose analysis on 17 COCO keypoints:
+    1. Strict side/3-quarter aiming (>= 140 deg extended outward at chest/shoulder height)
+    2. Strict 2-hand raised frontal stance (converging wrists above elbows in front of upper chest)
+    3. Semi-ready arm metadata (bent/forward/converging hold >= 105 deg) used strictly
+       to boost held-weapon detections into instant Tier-1 GUN+POSE confirmation.
+    """
+    kp = np.asarray(keypoints, dtype=np.float32)
+    empty = {
+        "is_threat": False, "pose_score": 0.0, "confidence": "NONE",
+        "details": [], "semi_ready_arms": set(), "two_hand_close": False,
     }
+    if kp.shape[0] < 13:
+        return empty
 
-    def get_xy(idx):
-        """Extracts (x, y) coordinates for a given keypoint index, filtering by confidence."""
-        conf = keypoints_batch[:, idx, 2] # Confidence score
-        mask = conf > confidence_threshold # Mask for confident keypoints
-        xy = keypoints_batch[:, idx, :2].astype(np.float32) # (x, y) coordinates
-        xy[~mask] = np.nan # Set non-confident keypoints to NaN
-        return xy
+    def pt(idx, c=conf_thresh):
+        return kp[idx, :2] if kp[idx, 2] >= c else None
 
-    # Get coordinates for relevant keypoints
-    left_shoulder = get_xy(idxs['left_shoulder'])
-    right_shoulder = get_xy(idxs['right_shoulder'])
-    left_elbow = get_xy(idxs['left_elbow'])
-    right_elbow = get_xy(idxs['right_elbow'])
-    left_wrist = get_xy(idxs['left_wrist'])
-    right_wrist = get_xy(idxs['right_wrist'])
-    left_hip = get_xy(idxs['left_hip'])
-    right_hip = get_xy(idxs['right_hip'])
+    ls, rs = pt(5), pt(6)
+    le, re = pt(7), pt(8)
+    lw, rw = pt(9), pt(10)
+    lh, rh = pt(11), pt(12)
 
-    # Calculate torso center (midpoint of hips)
-    torso_center = np.nanmean(np.stack([left_hip, right_hip], axis=1), axis=1)
+    box_h = max(1.0, float(box[3] - box[1]))
+    torso_candidates = []
+    if ls is not None and lh is not None:
+        torso_candidates.append(np.linalg.norm(ls - lh))
+    if rs is not None and rh is not None:
+        torso_candidates.append(np.linalg.norm(rs - rh))
+    torso_h = max(float(np.mean(torso_candidates)) if torso_candidates else 0.0, box_h * 0.28, 25.0)
+    sw = float(np.linalg.norm(ls - rs)) if (ls is not None and rs is not None) else 0.0
 
-    def arm_straight(shoulder, elbow, wrist, threshold=40):
-        """Vectorized check for straight arm using numpy."""
+    semi_ready_arms = set()
+
+    def check_arm(side, shoulder, elbow, wrist):
+        if shoulder is None or elbow is None or wrist is None:
+            return False, None, 0.0
         v1 = shoulder - elbow
         v2 = wrist - elbow
-        dot = np.nansum(v1 * v2, axis=1) # Dot product
-        mag1 = np.linalg.norm(v1, axis=1) # Magnitude
-        mag2 = np.linalg.norm(v2, axis=1)
-        
-        # Handle division by zero for magnitudes
-        with np.errstate(divide='ignore', invalid='ignore'):
-            cos_angle = dot / (mag1 * mag2)
-        
-        cos_angle = np.clip(cos_angle, -1.0, 1.0)
-        angles = np.degrees(np.arccos(cos_angle))
-        
-        # Determine if straight, setting to False if angle is NaN (due to missing keypoints)
-        straight = np.abs(180.0 - angles) <= threshold
-        straight[np.isnan(angles)] = False
-        return straight, angles
+        mag = np.linalg.norm(v1) * np.linalg.norm(v2)
+        if mag < 1e-5:
+            return False, None, 0.0
+        cos_a = np.clip(np.dot(v1, v2) / mag, -1.0, 1.0)
+        angle = float(np.degrees(np.arccos(cos_a)))
 
-    # Check straightness of left and right arms
-    left_arm_straight, left_arm_angle = arm_straight(left_shoulder, left_elbow, left_wrist)
-    right_arm_straight, right_arm_angle = arm_straight(right_shoulder, right_elbow, right_wrist)
+        dx_wrist = abs(float(wrist[0] - shoulder[0]))
+        dx_elbow = abs(float(elbow[0] - shoulder[0]))
+        dy_wrist = float(wrist[1] - shoulder[1])
 
-    def is_forward_aiming(shoulder, wrist, torso, max_y_diff=51.0):
-        """Vectorized check if arm is aiming forward."""
-        dx = wrist[:, 0] - torso[:, 0] # Horizontal displacement from torso center
-        dy = np.abs(wrist[:, 1] - shoulder[:, 1]) # Vertical difference between wrist and shoulder
-        
-        # Aiming if horizontal displacement is significant and vertical is small
-        aiming = (np.abs(dx) > 50.0) & (dy < max_y_diff)
-        
-        # Set to False if any component is NaN
-        aiming[np.isnan(dx) | np.isnan(dy)] = False
-        return aiming
+        is_straight = angle >= 140.0
+        is_outward = (dx_wrist > dx_elbow * 1.04) and (dx_wrist > 0.32 * torso_h)
+        is_level = -0.35 * torso_h <= dy_wrist <= 0.52 * torso_h
 
-    # Check if left and right arms are aiming forward
-    left_forward = is_forward_aiming(left_shoulder, left_wrist, torso_center)
-    right_forward = is_forward_aiming(right_shoulder, right_wrist, torso_center)
+        # Semi-ready arm stance (only active when paired with a weapon in that hand)
+        if angle >= 105.0 and (-0.45 * torso_h <= dy_wrist <= 0.90 * torso_h):
+            semi_ready_arms.add(side)
 
-    # A person is a threat if either arm is straight AND aiming forward
-    is_threat = (left_arm_straight & left_forward) | (right_arm_straight & right_forward)
+        ang_score = max(0.0, min(1.0, (angle - 110.0) / 70.0))
+        ext_score = max(0.0, min(1.0, dx_wrist / (0.60 * torso_h)))
+        lvl_score = max(0.0, min(1.0, 1.0 - (abs(dy_wrist) / (0.90 * torso_h))))
+        arm_score = float(ang_score * ext_score * lvl_score)
+        return (is_straight and is_outward and is_level), angle, arm_score
 
-    results = []
-    for i in range(N):
-        threat_details = []
-        if left_arm_straight[i] and left_forward[i]:
-            threat_details.append("Left arm aiming forward")
-        if right_arm_straight[i] and right_forward[i]:
-            threat_details.append("Right arm aiming forward")
-        
-        results.append({
-            'is_threat': bool(is_threat[i]),
-            'left_arm_straight': bool(left_arm_straight[i]),
-            'right_arm_straight': bool(right_arm_straight[i]),
-            'left_arm_angle': float(left_arm_angle[i]) if not np.isnan(left_arm_angle[i]) else None,
-            'right_arm_angle': float(right_arm_angle[i]) if not np.isnan(right_arm_angle[i]) else None,
-            'threat_details': threat_details
-        })
-    
-    # If only one person, return a single dict for convenience
-    if results and N == 1:
-        return results[0]
-    return results
+    l_aim, l_ang, l_score = check_arm("L", ls, le, lw)
+    r_aim, r_ang, r_score = check_arm("R", rs, re, rw)
 
-def mark_confirmed_threat(frame, bbox, threat_details, confidence_level="HIGH"):
-    """
-    Draws a bounding box and threat labels on the frame for a confirmed threat.
-    """
-    x1, y1, x2, y2 = map(int, bbox)
-    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 4) # Red box for threat
-    
-    # Blinking effect for the outer rectangle
-    if int(time.time() * 3) % 2:
-        cv2.rectangle(frame, (x1-5, y1-5), (x2+5, y2+5), (0, 0, 255), 2)
-    
-    label_y = y1 - 15
-    cv2.putText(frame, "🚨 CONFIRMED THREAT", (x1, label_y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-    
-    # Display threat details
-    for i, detail in enumerate(threat_details):
-        detail_y = y1 - 35 - (i * 20)
-        cv2.putText(frame, detail, (x1, detail_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    front_2h = False
+    front_2h_score = 0.0
+    two_hand_close = False
+    # Check close two-hand wrist convergence (even at waist/chest low-ready)
+    lw_soft, rw_soft = pt(9, 0.40), pt(10, 0.40)
+    if ls is not None and rs is not None and lw_soft is not None and rw_soft is not None and sw > 0.14 * box_h:
+        w_dist_soft = float(np.linalg.norm(lw_soft - rw_soft))
+        if w_dist_soft <= 0.85 * sw:
+            two_hand_close = True
 
-def crop_person(frame, bbox):
-    """Crops the person bounding box from the frame."""
-    x1, y1, x2, y2 = map(int, bbox)
-    crop = frame[y1:y2, x1:x2]
-    
-    if crop.size == 0: # Handle empty crop if bbox is out of bounds or invalid
-        return crop
-    
-    return crop
-
-# Initialize Re-ID model
-reid_model = torchreid.models.build_model(
-    name='osnet_x1_0', # OSNet is a lightweight and effective Re-ID model
-    num_classes=1041,  # Number of classes in the pre-training dataset (MSMT17)
-    loss='softmax',
-    pretrained=False   # We load weights manually
-)
-# Path to the pre-trained Re-ID model weights
-# IMPORTANT: Update this path to where you've saved the .pth file
-weight_path = r'C:\Users\Omprakash\Desktop\pthon\osnet_x1_0_msmt17_combineall_256x128_amsgrad_ep150_stp60_lr0.0015_b64_fb10_softmax_labelsmooth_flip_jitter.pth'
-torchreid.utils.load_pretrained_weights(reid_model, weight_path)
-reid_model.eval() # Set model to evaluation mode
-reid_model.cuda() # Move model to GPU if available
-
-# Define Re-ID image transformation pipeline
-reid_transform = torchreid.data.transforms.build_transforms(
-    height=256,
-    width=128,
-    norm_mean=[0.485, 0.456, 0.406], # ImageNet mean for normalization
-    norm_std=[0.229, 0.224, 0.225]   # ImageNet std for normalization
-)[0] # Take the first transform (train transform is typically [0], val is [1])
-
-def extract_reid_feature(image_bgr, model):
-    """
-    Extracts re-identification features from a cropped person image.
-
-    Args:
-        image_bgr (np.array): Cropped person image in BGR format.
-        model (torch.nn.Module): The Re-ID model.
-
-    Returns:
-        np.array: Normalized feature vector.
-    """
-    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB) # Convert BGR to RGB for PIL
-    pil_image = Image.fromarray(image_rgb) # Convert to PIL Image
-    image = reid_transform(pil_image).unsqueeze(0).cuda() # Apply transforms, add batch dim, move to GPU
-
-    # Optional: Profile Re-ID inference (uncomment for detailed profiling)
-    # with torch.profiler.profile(
-    #     activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-    #     record_shapes=True,
-    #     profile_memory=True,
-    #     with_stack=True
-    # ) as prof:
-    with torch.no_grad(): # Disable gradient calculation for inference
-        features = model(image)
-    # prof.export_chrome_trace("reid_inference_trace.json") # Export trace if profiling
-    
-    features_np = features.cpu().numpy().flatten() # Move to CPU, convert to numpy, flatten
-    features_np = features_np / np.linalg.norm(features_np) # L2 normalize features
-    return features_np
-
-# FAISS for efficient similarity search
-feature_matrix = None # Stores all person features
-person_ids = []       # Corresponding person IDs for the feature matrix
-feature_index = None  # FAISS index for fast search
-
-def initialize_faiss_index():
-    """
-    Initializes or re-initializes the FAISS index. Attempts to use GPU if available.
-    """
-    global feature_index
-    dimension = 512 # Dimension of OSNet features
-    feature_index = faiss.IndexFlatIP(dimension) # Inner Product for cosine similarity
-
-    # Try to use FAISS GPU acceleration
-    if torch.cuda.is_available():
-        try:
-            # Check for StandardGpuResources, which is the typical way to get GPU resources in newer FAISS versions
-            if hasattr(faiss, 'StandardGpuResources'):
-                res = faiss.StandardGpuResources()
-                feature_index = faiss.index_cpu_to_gpu(res, 0, feature_index) # Move index to GPU 0
-                print("Using FAISS GPU acceleration")
-            else:
-                # Fallback for older FAISS versions or other configurations
-                print("FAISS GPU not available via StandardGpuResources, trying fallback or using CPU version")
-                # You might need faiss.GpuResources or direct index_cpu_to_gpu with a GpuIndex
-        except Exception as e:
-            print(f"FAISS GPU initialization failed: {e}, using CPU version")
-    
-    return feature_index
-
-def update_feature_matrix(stored_features):
-    """
-    Updates the FAISS index with new or updated person features.
-
-    Args:
-        stored_features (dict): Dictionary of {person_id: reid_feature}.
-    """
-    global feature_matrix, person_ids, feature_index
-    
-    if not stored_features:
-        feature_matrix = None
-        person_ids = []
-        if feature_index is not None:
-            feature_index.reset() # Clear the index if no features
-        return
-    
-    person_ids = list(stored_features.keys())
-    feature_matrix = np.array([stored_features[pid] for pid in person_ids])
-    
-    # Re-normalize features if they are not already (important for IP index)
-    feature_matrix = feature_matrix / np.linalg.norm(feature_matrix, axis=1, keepdims=True)
-    
-    if feature_index is None:
-        feature_index = initialize_faiss_index() # Initialize if not already
-    else:
-        feature_index.reset() # Clear existing data before adding new
-    
-    feature_index.add(feature_matrix.astype(np.float32)) # Add features to the index
-
-def find_best_match_vectorized(query_feature, stored_features, threshold=0.38):
-    """
-    Finds the best matching person ID for a query feature using the FAISS index.
-
-    Args:
-        query_feature (np.array): Feature vector of the person to match.
-        stored_features (dict): Dictionary of existing {person_id: feature_vector} pairs.
-        threshold (float): Similarity threshold for a match to be considered valid.
-
-    Returns:
-        tuple: (matched_person_id, similarity_score) or (None, best_similarity_found) if no match.
-    """
-    global feature_matrix, person_ids, feature_index
-    
-    if not stored_features:
-        return None, -1
-    
-    # Rebuild feature matrix and FAISS index if dimensions change or initially empty
-    if feature_matrix is None or len(stored_features) != len(person_ids) or \
-       (person_ids and sorted(list(stored_features.keys())) != sorted(person_ids)):
-        update_feature_matrix(stored_features) # Call the update function to rebuild
-
-    query_normalized = query_feature / np.linalg.norm(query_feature) # Normalize query feature
-    
-    if feature_index is not None and feature_index.ntotal > 0:
-        # Search the FAISS index for the top 10 most similar features
-        similarities, indices = feature_index.search(
-            query_normalized.reshape(1, -1).astype(np.float32), 
-            min(len(person_ids), 10) # Search up to 10 nearest neighbors
+    if ls is not None and rs is not None and lw is not None and rw is not None and sw > 0.16 * box_h:
+        w_dist = float(np.linalg.norm(lw - rw))
+        mid_sh = 0.5 * (ls + rs)
+        mid_wr = 0.5 * (lw + rw)
+        dy_wr = float(mid_wr[1] - mid_sh[1])
+        raised_above_elbows = (
+            (le is not None and lw[1] <= le[1] + 0.05 * torso_h)
+            and (re is not None and rw[1] <= re[1] + 0.05 * torso_h)
         )
-        similarities = similarities.flatten()
-        indices = indices.flatten()
-        
-        best_idx = -1
-        best_similarity = -1.0
-        
-        # Iterate through search results and find the best match above threshold
-        for i, (sim, idx) in enumerate(zip(similarities, indices)):
-            if idx < len(person_ids) and sim > threshold:
-                if sim > best_similarity:
-                    best_similarity = sim
-                    best_idx = idx
-        
-        if best_idx >= 0:
-            return person_ids[best_idx], best_similarity
-    
-    # Fallback to pure numpy calculation if FAISS fails or for small sets (less efficient)
-    # This part should ideally be rarely hit if FAISS is set up correctly
-    if feature_matrix is not None:
-        similarities = feature_matrix @ query_normalized
-        best_idx = np.argmax(similarities)
-        best_similarity = similarities[best_idx]
-        if best_similarity > threshold:
-            return person_ids[best_idx], best_similarity
-            
-    return None, best_similarity # No match found or below threshold
+        if (
+            w_dist <= 0.50 * sw
+            and (-0.20 * torso_h <= dy_wr <= 0.45 * torso_h)
+            and abs(mid_wr[0] - mid_sh[0]) <= 0.65 * sw
+            and raised_above_elbows
+        ):
+            front_2h = True
+            front_2h_score = max(0.0, min(1.0, 1.0 - (w_dist / (0.65 * sw))))
 
-def save_criminal_data(person_id, reid_feature, cropped_image, frame_count):
-    """
-    Saves the cropped image and re-identification feature of a detected criminal.
-    """
-    # Create directories if they don't exist
-    os.makedirs("criminal_data", exist_ok=True)
-    os.makedirs("criminal_data/images", exist_ok=True)
-    os.makedirs("criminal_data/features", exist_ok=True)
-    
-    # Define file paths
-    image_path = f"criminal_data/images/criminal_{person_id[0]}_{person_id[1]}_frame_{frame_count}.jpg"
-    feature_path = f"criminal_data/features/criminal_{person_id[0]}_{person_id[1]}_frame_{frame_count}.npy"
-    
-    # Save image and feature
-    cv2.imwrite(image_path, cropped_image)
-    np.save(feature_path, reid_feature)
-    
-    print(f"💾 Saved criminal data: {image_path}, {feature_path}")
-    return image_path, feature_path
+    pose_score = max(l_score, r_score, front_2h_score)
+    details = []
+    if l_aim:
+        details.append(f"L-Arm Aim ({l_ang:.0f}deg)")
+    if r_aim:
+        details.append(f"R-Arm Aim ({r_ang:.0f}deg)")
+    if front_2h:
+        details.append("2-Hand Front Stance")
 
-# Main execution block
-if __name__ == "__main__":
-    # Load YOLOv8 pose model
-    # IMPORTANT: Update this path to your yolov8n-pose.pt file
-    model = YOLO(r"C:\Users\Omprakash\Desktop\pthon\yolov8n-pose.pt") 
-    
-    # Load video
-    # IMPORTANT: Update this path to your video file
-    video_path = r".mp4"
-    cap = cv2.VideoCapture(video_path)
+    if front_2h or (l_aim and r_aim):
+        conf_lvl = "HIGH (2-Hand)"
+    elif l_aim or r_aim:
+        conf_lvl = "MEDIUM (1-Hand)"
+    else:
+        conf_lvl = "NONE"
 
-    # Initialize OpenCV window
-    cv2.startWindowThread() # Required for some OpenCV installations to manage windows
-    cv2.namedWindow("Persistent Threat Detection", cv2.WINDOW_NORMAL)
+    return {
+        "is_threat": (l_aim or r_aim or front_2h),
+        "pose_score": pose_score,
+        "confidence": conf_lvl,
+        "details": details,
+        "semi_ready_arms": semi_ready_arms,
+        "two_hand_close": two_hand_close,
+    }
 
-    total_threats = 0 # Keeps track of the maximum number of threats detected simultaneously
-    active_threats = 0 # Number of threats in the current frame
 
-    print("Starting criminal detection...")
-    print("Press 'q' to quit, 'p' for performance summary (currently placeholder)")
+def crop_person(frame: np.ndarray, bbox) -> np.ndarray:
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = map(int, bbox)
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 <= x1 or y2 <= y1:
+        return np.empty(0, dtype=np.uint8)
+    return frame[y1:y2, x1:x2]
 
-    FRAME_SKIP = 2 # Process every Nth frame to improve performance
+
+def save_criminal_data(output_dir: str, suspect_id: int, reid_feature: np.ndarray, cropped_image: np.ndarray, frame_idx: int):
+    img_dir = os.path.join(output_dir, "images")
+    feat_dir = os.path.join(output_dir, "features")
+    with _save_lock:
+        os.makedirs(img_dir, exist_ok=True)
+        os.makedirs(feat_dir, exist_ok=True)
+        tag = f"criminal_{suspect_id}_0_frame_{frame_idx}"
+        cv2.imwrite(os.path.join(img_dir, f"{tag}.jpg"), cropped_image)
+        np.save(os.path.join(feat_dir, f"{tag}.npy"), reid_feature)
+
+
+def match_existing_suspect(feat: np.ndarray, color_feat: np.ndarray, saved_profiles: dict):
+    for sid, prof in saved_profiles.items():
+        r_sim = float(np.dot(feat, prof["reid"]))
+        c_sim = float(np.dot(color_feat, prof["color"]))
+        if r_sim >= 0.72 and c_sim >= 0.65:
+            return sid
+    return None
+
+
+def _extract_weapon_boxes(w_res, model_names, offset_x: float = 0.0, offset_y: float = 0.0) -> list:
+    """Parse Ultralytics weapon predictions into canonical (x1, y1, x2, y2, conf, cls_name) tuples."""
+    dets = []
+    for wr in w_res:
+        if wr.boxes is None:
+            continue
+        w_boxes = wr.boxes.xyxy.cpu().numpy() if hasattr(wr.boxes.xyxy, "cpu") else np.asarray(wr.boxes.xyxy)
+        w_cls = wr.boxes.cls.int().cpu().tolist()
+        w_cf = wr.boxes.conf.cpu().tolist()
+        for wb, wc, cf in zip(w_boxes, w_cls, w_cf):
+            cname = str(model_names.get(int(wc), wc))
+            if cname.lower() in WEAPON_CLASS_NAMES:
+                dets.append((
+                    float(wb[0]) + offset_x,
+                    float(wb[1]) + offset_y,
+                    float(wb[2]) + offset_x,
+                    float(wb[3]) + offset_y,
+                    float(cf),
+                    cname,
+                ))
+    return dets
+
+
+def _load_weapon_model(weapon_arg: str):
+    """Resolve and security-verify requested weapon detector ('auto', 'onnx', 'none', or path)."""
+    if not weapon_arg or weapon_arg.lower() == "none":
+        return None
+    low = weapon_arg.lower()
+    if low == "auto":
+        w_path = ensure_cctv_weapon_model()
+    elif low == "onnx":
+        w_path = ensure_weapon_onnx_model()
+    elif os.path.isfile(weapon_arg):
+        if weapon_arg.endswith(".pt") and not verify_pytorch_checkpoint_safety(weapon_arg):
+            raise RuntimeError(f"Blocked unsafe PyTorch checkpoint: {weapon_arg}")
+        w_path = weapon_arg
+    else:
+        print(f"Warning: weapon model '{weapon_arg}' not found; running pose-only mode.")
+        return None
+    if w_path and os.path.isfile(w_path):
+        wm = YOLO(w_path, task="detect")
+        print(f"Loaded verified weapon detector: {w_path} (classes: {wm.names})")
+        return wm
+    return None
+
+
+def run_detector(args):
+    source = int(args.source) if args.source.isdigit() else args.source
+    cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video source: {args.source}")
+
+    pose_model = YOLO(args.pose_model)
+    weapon_model = _load_weapon_model(args.weapon_model)
+    reid_model, device = load_osnet_model(args.osnet_weights)
+
+    tracker_cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bytetrack_custom.yaml")
+    if not os.path.isfile(tracker_cfg):
+        tracker_cfg = "bytetrack.yaml"
+
+    writer = None
+    if args.save_video:
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        writer = cv2.VideoWriter(args.save_video, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+
+    if not args.no_display:
+        cv2.namedWindow("Ground Threat Detector", cv2.WINDOW_NORMAL)
+
+    pose_windows = defaultdict(lambda: deque(maxlen=args.persistence))
+    gun_windows = defaultdict(lambda: deque(maxlen=args.persistence))
+    both_windows = defaultdict(lambda: deque(maxlen=args.persistence))
+    confirmed_tiers = {}  # tid -> tier string
+    track_to_suspect = {}
+    saved_profiles = {}
+    threads = []
+    cached_people_draw = []
+    cached_weapon_draw = []
+
+    internal_wconf = min(0.22, args.weapon_conf)
+    frame_count = 0
+    max_threats = 0
+    yolo_times, weapon_times, reid_times, frame_times = [], [], [], []
+
+    print(f"Starting ground threat detection ({args.pose_model} + ByteTrack) on: {args.source} (device: {device})")
 
     while cap.isOpened():
-        frame_start_time = time.time() # Start time for frame processing
-        ret, frame = cap.read() # Read a frame
+        t_frame = time.perf_counter()
+        ret, frame = cap.read()
         if not ret:
-            break # Exit if video ends
-
-        update_frame() # Increment global frame counter
-        
-        process_this_frame = (frame_count % FRAME_SKIP == 0) # Check if we should process this frame
-
-        if not detection_stopped and process_this_frame:
-            yolo_start = time.time()
-            results = model(frame, conf=0.3) # Run YOLO detection and pose estimation
-            yolo_time = (time.time() - yolo_start) * 1000 # Time taken for YOLO
-            
-            annotated_frame = frame.copy() # Create a copy for drawing annotations
-        else:
-            annotated_frame = frame.copy()
-            results = [] # No results if detection is stopped or frame is skipped
-        
-        current_frame_threats = 0 # Counter for threats in the current frame
-
-        if not detection_stopped and process_this_frame:
-            for r in results: # Iterate through YOLO results (each 'r' is a results object for a batch or single image)
-                if r.keypoints is not None and r.boxes is not None:
-                    # Iterate through each detected person's keypoints and bounding box
-                    for j, (keypoints, box) in enumerate(zip(r.keypoints.data, r.boxes.xyxy)):
-                        # Ensure data is on CPU and is a numpy array
-                        if hasattr(keypoints, 'cpu'):
-                            keypoints = keypoints.cpu().numpy()
-                        if hasattr(box, 'cpu'):
-                            box = box.cpu().numpy()
-
-                        pose_start = time.time()
-                        analysis = analyze_pose_threat(keypoints) # Analyze pose for threat
-                        pose_time = (time.time() - pose_start) * 1000 # Time taken for pose analysis
-                        
-                        is_confirmed_threat = add_threat_detection(box, analysis['is_threat']) # Update threat history and confirm
-                        person_id = _get_person_id(box) # Get ID for the current person
-
-                        if person_id in confirmed_threats:
-                            mark_confirmed_threat(annotated_frame, box, analysis['threat_details']) # Draw threat indicators
-                            
-                            crop_start = time.time()
-                            cropped = crop_person(frame, box) # Crop the person's image
-                            crop_time = (time.time() - crop_start) * 1000 # Time taken for cropping
-                            
-                            if cropped.size != 0: # Ensure the crop is not empty
-                                reid_start = time.time()
-                                reid_feature = extract_reid_feature(cropped, reid_model) # Extract Re-ID features
-                                reid_time = (time.time() - reid_start) * 1000 # Time taken for Re-ID feature extraction
-                                
-                                reid_features[person_id] = reid_feature # Store the feature
-                                
-                                update_feature_matrix(reid_features) # Update FAISS index with new features
-                                
-                                save_start = time.time()
-                                # Save criminal data in a separate thread to avoid blocking the main loop
-                                Thread(target=save_criminal_data, args=(person_id, reid_feature, cropped, frame_count)).start()
-                                # Save time is negligible due to threading here.
-                                
-                                detection_stopped = True # Stop detection after a criminal is identified and saved
-                                print(f"Detection stopped after saving criminal {person_id}")
-                                
-                            current_frame_threats += 1 # Increment current frame threat count
-                            
-                            # Print threat details to console
-                            left_angle = analysis['left_arm_angle'] if analysis['left_arm_angle'] is not None else "N/A"
-                            right_angle = analysis['right_arm_angle'] if analysis['right_arm_angle'] is not None else "N/A"
-                            print(f" PERSISTENT THREAT - Person {j+1}: "
-                                  f"Left arm straight: {analysis['left_arm_straight']}, "
-                                  f"Right arm straight: {analysis['right_arm_straight']}, "
-                                  f"Left angle: {left_angle}, Right angle: {right_angle}")
-        else:
-            if detection_stopped:
-                # Display message when detection is stopped
-                cv2.putText(annotated_frame, "DETECTION STOPPED - Criminal Saved", (10, 30), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                cv2.putText(annotated_frame, f"Criminals Saved: {len(reid_features)}", (10, 60), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-        frame_time = (time.time() - frame_start_time) * 1000 # Total time to process the frame
-
-        active_threats = current_frame_threats # Update active threats for display
-        if current_frame_threats > 0:
-            total_threats = max(total_threats, current_frame_threats) # Keep track of max threats
-
-        # Display performance and status on the frame
-        cv2.putText(annotated_frame, f"Active Threats: {active_threats}",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-        cv2.putText(annotated_frame, f"Total Detected: {total_threats}",
-                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(annotated_frame, f"Frame: {frame_count}",
-                    (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
-        current_fps = 1000 / frame_time if frame_time > 0 else 0
-        cv2.putText(annotated_frame, f"FPS: {current_fps:.1f}", (10, 110), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-        cv2.putText(annotated_frame, f"Frame Time: {frame_time:.1f}ms", (10, 130), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-
-        cv2.imshow("Persistent Threat Detection", annotated_frame) # Show the annotated frame
-        
-        # Handle keyboard input
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"): # Quit
             break
-        elif key == ord("p"):
-            # Placeholder for performance summary (can be expanded to print detailed timings)
-            print("\nPerformance summary requested:")
-            # Example: print(f"YOLO Time: {yolo_time:.1f}ms, Pose Time: {pose_time:.1f}ms, Re-ID Time: {reid_time:.1f}ms")
-            # Note: `yolo_time`, `pose_time`, `reid_time` are local to the loop and would need to be accumulated.
 
-    # Release video capture and destroy all OpenCV windows
+        frame_count += 1
+        annotated = frame.copy()
+        fh, fw = frame.shape[:2]
+
+        if frame_count % args.frame_skip == 0:
+            t0 = time.perf_counter()
+            results = pose_model.track(
+                frame, persist=True, tracker=tracker_cfg, conf=args.conf, verbose=False
+            )
+            yolo_times.append((time.perf_counter() - t0) * 1000.0)
+
+            # Collect tracked people & forearm grip rays
+            tracked_people = []
+            person_entries_for_match = []
+            for r in results:
+                if r.keypoints is None or r.boxes is None:
+                    continue
+                boxes = r.boxes.xyxy.cpu().numpy() if hasattr(r.boxes.xyxy, "cpu") else np.asarray(r.boxes.xyxy)
+                kps = r.keypoints.data.cpu().numpy() if hasattr(r.keypoints.data, "cpu") else np.asarray(r.keypoints.data)
+                ids = r.boxes.id.int().cpu().tolist() if r.boxes.id is not None else list(range(len(boxes)))
+                for tid, kp_np, box_np in zip(ids, kps, boxes):
+                    arm_grips = get_arm_grips(kp_np, box_np, conf_thresh=0.40)
+                    tracked_people.append((tid, kp_np, box_np, arm_grips))
+                    person_entries_for_match.append((tid, box_np, arm_grips))
+
+            # Dual-Pass Weapon Inference: Pass 1 (Full Frame) + Pass 2 (Wrist-ROI zoom)
+            weapon_detections = []
+            if weapon_model is not None:
+                tw = time.perf_counter()
+                w_res = weapon_model(frame, conf=internal_wconf, verbose=False)
+                weapon_detections = _extract_weapon_boxes(w_res, weapon_model.names)
+
+                pass1_match = assign_weapons_to_people(weapon_detections, person_entries_for_match)
+                if args.wrist_roi:
+                    roi_ran = 0
+                    for tid, kp_np, box_np, _arm_grips in tracked_people:
+                        if roi_ran >= args.max_roi_people:
+                            break
+                        best_p1 = max((g[0][4] for g in pass1_match.get(tid, [])), default=0.0)
+                        if best_p1 >= 0.50:
+                            continue  # Already crisp on full frame
+                        roi = build_wrist_roi(kp_np, box_np, fw, fh)
+                        if roi is None:
+                            continue
+                        rx1, ry1, rx2, ry2 = roi
+                        roi_res = weapon_model(frame[ry1:ry2, rx1:rx2], conf=internal_wconf, verbose=False)
+                        weapon_detections.extend(_extract_weapon_boxes(roi_res, weapon_model.names, rx1, ry1))
+                        roi_ran += 1
+
+                weapon_detections = deduplicate_weapons(weapon_detections, iou_thresh=0.45)
+                weapon_times.append((time.perf_counter() - tw) * 1000.0)
+
+            # 1-to-1 forearm grip ray assignment
+            raw_person_weapons = assign_weapons_to_people(weapon_detections, person_entries_for_match)
+
+            # Analyze pose + apply Pose-Prior gate on low-conf weapons & compute coordinated state
+            person_states = []
+            held_box_map = {}  # wbox -> arm_side
+            for tid, kp_np, box_np, arm_grips in tracked_people:
+                analysis = analyze_pose_threat(kp_np, box_np, conf_thresh=args.kp_conf)
+                candidates = raw_person_weapons.get(tid, [])
+                held_guns = []
+                for wb, arm_side, dist in candidates:
+                    w_cf = wb[4]
+                    strict_or_2h = analysis["is_threat"] or (
+                        analysis["two_hand_close"] and arm_side in analysis["semi_ready_arms"]
+                    )
+                    if w_cf >= args.weapon_conf or (w_cf >= 0.28 and strict_or_2h):
+                        held_guns.append((wb, arm_side, dist))
+                        held_box_map[wb] = arm_side
+                person_states.append((tid, kp_np, box_np, arm_grips, analysis, held_guns))
+
+            cached_weapon_draw = []
+            for wb in weapon_detections:
+                if wb in held_box_map:
+                    cached_weapon_draw.append((wb, True, held_box_map[wb]))
+                elif wb[4] >= max(0.50, args.weapon_conf):
+                    cached_weapon_draw.append((wb, False, ""))
+
+            cached_people_draw = []
+            for tid, _kp_np, box_np, arm_grips, analysis, held_guns in person_states:
+                has_gun = len(held_guns) > 0
+                has_pose = analysis["is_threat"]
+                gun_conf = max((g[0][4] for g in held_guns), default=0.0)
+                arm_semi_ready = any(arm_s in analysis["semi_ready_arms"] for _, arm_s, _ in held_guns)
+                has_ready_with_gun = has_gun and (
+                    has_pose
+                    or (gun_conf >= 0.45 and (analysis["two_hand_close"] or arm_semi_ready))
+                )
+
+                pose_windows[tid].append(1 if has_pose else 0)
+                gun_windows[tid].append(1 if has_gun else 0)
+                both_windows[tid].append(1 if has_ready_with_gun else 0)
+
+                p_hits = sum(pose_windows[tid])
+                g_hits = sum(gun_windows[tid])
+                b_hits = sum(both_windows[tid])
+
+                # Complementary coordinated threat probability
+                pose_prob = 0.45 * analysis["pose_score"] + 0.55 * min(1.0, p_hits / float(args.confirm_frames))
+                gun_prob = (
+                    0.50 * gun_conf + 0.50 * min(1.0, g_hits / float(max(1, args.gun_confirm)))
+                    if (g_hits > 0 or has_gun)
+                    else 0.0
+                )
+                if b_hits > 0 or has_ready_with_gun:
+                    live_prob = 100.0 * min(1.0, max(pose_prob, gun_prob, 0.72) + 0.15)
+                else:
+                    live_prob = 100.0 * max(pose_prob, gun_prob)
+
+                # Rapid Sub-Second 3-Tier Confirmation + Hysteresis
+                # 1-frame instant lock ONLY on same-frame Strict Aiming Pose + Held Gun (or ultra-high conf >= 0.85);
+                # otherwise 2-frame lock (~0.07-0.13s) kills single-frame hand-blur/shadow false positives.
+                same_frame_dual = has_pose and has_gun
+                if same_frame_dual or b_hits >= 2:
+                    confirmed_tiers[tid] = "GUN+POSE"
+                elif (has_gun and gun_conf >= args.instant_gun_conf) or g_hits >= args.gun_confirm:
+                    confirmed_tiers[tid] = "GUN-IN-HAND"
+                elif p_hits >= args.confirm_frames:
+                    confirmed_tiers[tid] = "POSE"
+                elif tid in confirmed_tiers:
+                    if g_hits == 0 and b_hits == 0 and p_hits < max(1, args.confirm_frames // 2):
+                        del confirmed_tiers[tid]
+
+                is_confirmed = tid in confirmed_tiers
+                if is_confirmed:
+                    tier = confirmed_tiers[tid]
+                    if tid not in track_to_suspect:
+                        crop = crop_person(frame, box_np)
+                        if crop.size > 0:
+                            t_r = time.perf_counter()
+                            feat = extract_reid_feature(crop, reid_model, device)
+                            color_feat = extract_outfit_color_feature(crop)
+                            reid_times.append((time.perf_counter() - t_r) * 1000.0)
+                            if feat is not None:
+                                existing_sid = match_existing_suspect(feat, color_feat, saved_profiles)
+                                sid = existing_sid if existing_sid is not None else tid
+                                track_to_suspect[tid] = sid
+                                if existing_sid is None:
+                                    saved_profiles[sid] = {"reid": feat, "color": color_feat}
+                                    th = Thread(
+                                        target=save_criminal_data,
+                                        args=(args.output_dir, sid, feat, crop.copy(), frame_count),
+                                    )
+                                    th.start()
+                                    threads.append(th)
+                                    print(f"🚨 CONFIRMED THREAT SAVED — Suspect #{sid} (Track #{tid}) at frame {frame_count} [{tier}, {live_prob:.0f}%]")
+                                else:
+                                    print(f"🔗 Re-associated Track #{tid} -> existing Suspect #{sid} at frame {frame_count} [{tier}]")
+                    sid_disp = track_to_suspect.get(tid, tid)
+                    label = f"SUSPECT #{sid_disp} | {tier} {live_prob:.0f}%"
+                    color = (0, 0, 220)
+                elif g_hits > 0 or p_hits > 0 or live_prob >= 35.0:
+                    label = f"ID #{tid} | ARMING {live_prob:.0f}%"
+                    color = (0, 165, 255)
+                else:
+                    label = f"ID #{tid} | {live_prob:.0f}%"
+                    color = (40, 180, 70)
+
+                held_sides = {arm_s for _, arm_s, _ in held_guns}
+                active_rays = [g["ray_pts"] for g in arm_grips if has_gun and g["side"] in held_sides]
+                cached_people_draw.append((box_np, label, color, is_confirmed, active_rays))
+
+        # Render cached weapon boxes & people annotations smoothly (zero flicker)
+        for (wx1, wy1, wx2, wy2, w_conf, w_name), is_held, arm_side in cached_weapon_draw:
+            w_col = (0, 0, 255) if is_held else (200, 100, 255)
+            cv2.rectangle(annotated, (int(wx1), int(wy1)), (int(wx2), int(wy2)), w_col, 2)
+            tag_txt = f"{w_name.upper()} {w_conf:.2f}" + (f" [HELD {arm_side}]" if is_held else "")
+            cv2.putText(annotated, tag_txt, (int(wx1), max(15, int(wy1) - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, w_col, 2)
+
+        active_threats = 0
+        for box_np, label, color, is_conf, active_rays in cached_people_draw:
+            draw_corner_box(annotated, box_np, color, thickness=3 if is_conf else 2)
+            draw_label_pill(annotated, label, int(box_np[0]), int(box_np[1]), color)
+            for ray in active_rays:
+                if len(ray) >= 2:
+                    cv2.line(
+                        annotated,
+                        (int(ray[0][0]), int(ray[0][1])),
+                        (int(ray[-1][0]), int(ray[-1][1])),
+                        (0, 255, 255),
+                        2,
+                    )
+                cv2.circle(annotated, (int(ray[0][0]), int(ray[0][1])), 5, (0, 255, 255), -1)
+            if is_conf:
+                active_threats += 1
+
+        max_threats = max(max_threats, active_threats)
+        ft_ms = (time.perf_counter() - t_frame) * 1000.0
+        frame_times.append(ft_ms)
+        fps_now = 1000.0 / ft_ms if ft_ms > 0 else 0.0
+
+        status_txt = "STATUS: THREAT DETECTED" if active_threats > 0 else "STATUS: MONITORING (CLEAR)"
+        status_col = (0, 0, 210) if active_threats > 0 else (35, 160, 65)
+        draw_hud_panel(annotated, status_txt, status_col, [
+            f"Tracked People: {len(cached_people_draw)}   |   Active Threats: {active_threats}",
+            f"Saved Suspects: {len(saved_profiles)}   |   Frame: {frame_count}   |   FPS: {fps_now:.1f}",
+        ])
+
+        if writer is not None:
+            writer.write(annotated)
+
+        if not args.no_display:
+            cv2.imshow("Ground Threat Detector", annotated)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            elif key == ord("p") and frame_times:
+                print(
+                    f"[Perf] Frame: {np.mean(frame_times):.1f}ms | "
+                    f"Pose+Track: {np.mean(yolo_times) if yolo_times else 0:.1f}ms | "
+                    f"Weapon(Dual): {np.mean(weapon_times) if weapon_times else 0:.1f}ms"
+                )
+
+    for th in threads:
+        th.join()
     cap.release()
-    cv2.destroyAllWindows()
+    if writer is not None:
+        writer.release()
+    if not args.no_display:
+        cv2.destroyAllWindows()
 
-    # Final summary after the loop finishes
-    print(f"\n=== Detection Summary ===")
-    print(f"Total frames processed: {frame_count}")
-    print(f"Maximum simultaneous threats: {total_threats}")
-    print(f"Confirmed threat IDs: {len(confirmed_threats)}")
-    print(f"Criminal data saved: {len(reid_features)} persons")
-    print(f"Data saved in: criminal_data/ directory")
+    print("\n=== Ground Detection Summary ===")
+    print(f"Total frames processed : {frame_count}")
+    print(f"Max active threats     : {max_threats}")
+    print(f"Unique suspects saved  : {len(saved_profiles)} -> {args.output_dir}/")
+    if frame_times:
+        print(f"Avg frame time / FPS   : {np.mean(frame_times):.1f} ms ({1000.0/np.mean(frame_times):.1f} FPS)")
+    if yolo_times:
+        print(f"Avg Pose+ByteTrack     : {np.mean(yolo_times):.1f} ms")
+    if weapon_times:
+        print(f"Avg Weapon (Full+ROI)  : {np.mean(weapon_times):.1f} ms")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Ground camera ByteTrack + Pose + Dual-Pass Gun-Keypoint Fusion detector")
+    parser.add_argument("--source", required=True, help="Video file path or webcam index (e.g. 0)")
+    parser.add_argument("--pose-model", default="yolov8s-pose.pt", help="YOLOv8/11-Pose weights (default: yolov8s-pose.pt)")
+    parser.add_argument("--weapon-model", default="auto", help="Weapon detector ('auto' CCTV model, 'onnx' Hadi959, 'none', or path)")
+    parser.add_argument("--weapon-conf", type=float, default=0.35, help="Weapon confidence threshold (default: 0.35)")
+    parser.add_argument("--instant-gun-conf", type=float, default=0.85, help="1-frame instant gun-in-hand confidence (default: 0.85)")
+    parser.add_argument("--no-wrist-roi", dest="wrist_roi", action="store_false", help="Disable Pass-2 wrist-ROI zoom inference")
+    parser.add_argument("--max-roi-people", type=int, default=3, help="Max people per frame for Wrist-ROI weapon crop (default: 3)")
+    parser.add_argument("--osnet-weights", default=None, help="Optional OSNet .pth weights (falls back to MSMT17/ImageNet)")
+    parser.add_argument("--output-dir", default="criminal_data", help="Output directory for suspect crops/features")
+    parser.add_argument("--frame-skip", type=int, default=2, help="Run inference every Nth frame (default: 2)")
+    parser.add_argument("--conf", type=float, default=0.35, help="YOLO person detection confidence (default: 0.35)")
+    parser.add_argument("--kp-conf", type=float, default=0.55, help="Keypoint confidence threshold (default: 0.55)")
+    parser.add_argument("--persistence", type=int, default=8, help="Sliding window size in frames (default: 8)")
+    parser.add_argument("--confirm-frames", type=int, default=4, help="Pose-only frames required to confirm (default: 4)")
+    parser.add_argument("--gun-confirm", type=int, default=2, help="Gun-in-hand frames required to confirm (default: 2)")
+    parser.add_argument("--save-video", default=None, help="Optional path to save annotated output video (.mp4)")
+    parser.add_argument("--no-display", action="store_true", help="Run headless without OpenCV GUI window")
+
+    run_detector(parser.parse_args())
